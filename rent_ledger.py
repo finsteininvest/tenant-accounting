@@ -498,6 +498,66 @@ def cmd_example_demo(args):
                    ('M001','nka','2025-09-15', d2c(decimal.Decimal('180')), '2025-09-01', 'BK-Abrechnung 2024 Nachzahlung'))
     print("Demo-Daten eingespielt.")
 
+def cmd_nka_status(args):
+    # Stichtag / NKA-Konten parsen
+    asof = date.fromisoformat(args.asof) if args.asof else date.today()
+    nka_accounts = [a.strip() for a in args.nka_accounts.split(",") if a.strip()]
+
+    # 1) Alle NKA-Forderungen des Mieters laden (chronologisch)
+    with conn() as cx:
+        charges = cx.execute("""
+            SELECT id, due_date, amount_cents, IFNULL(issued_date,''), IFNULL(note,'')
+            FROM manual_charges
+            WHERE tenant_id=? AND kind='nka'
+            ORDER BY due_date, id
+        """, (args.tenant_id,)).fetchall()
+
+    if not charges:
+        print(f"Keine NKA-Forderungen für {args.tenant_id} gefunden.")
+        return
+
+    # 2) Zahlungen bis Stichtag aus den angegebenen Konten holen
+    #    -> fetch_payments liefert Liste[(date, amount_cents>0)] bereits chronologisch
+    payments = fetch_payments(conn(), args.tenant_id, nka_accounts, "1900-01-01", asof.isoformat())
+    pool = sum(amt for (_, amt) in payments)  # gesamter Zahlbetrag, der auf NKA angerechnet wird
+
+    # 3) FIFO-Anrechnung über die Forderungen
+    print(f"NKA-Status für {args.tenant_id} (Zahlungen bis {asof.isoformat()}, Konten: {', '.join(nka_accounts)})")
+    print("ID  | Fälligkeit | Ursprung | Bezahlt  | Offen    | Abrechn.-Dat. | Notiz | Status")
+    print("----+------------+----------+----------+----------+---------------+-------+--------")
+
+    total_orig = 0
+    total_paid = 0
+    total_open = 0
+
+    for (cid, due_date, amount_cents, issued_date, note) in charges:
+        orig = int(amount_cents)
+        total_orig += orig
+
+        if orig >= 0:
+            paid_here = min(orig, max(0, pool))
+            open_here = orig - paid_here
+            pool -= paid_here
+            status = "OK" if open_here == 0 else ("Teil" if paid_here > 0 else "Offen")
+        else:
+            # Negative NKA = Gutschrift -> erhöht den Zahlungspool, keine "offene" Forderung
+            pool += abs(orig)
+            paid_here = 0
+            open_here = 0
+            status = "Gutschrift"
+
+        total_paid += paid_here
+        total_open += open_here
+
+        print(f"{cid:<4}| {due_date:<10} | {c2s(orig):>8} | {c2s(paid_here):>8} | {c2s(open_here):>8} | {issued_date or '-':<13} | {(note or '')[:20]:<20} | {status}")
+
+        if args.detail and orig >= 0:
+            print(f"     ↳ Pool nach Anrechnung: {c2s(pool)}")
+
+    print("----+------------+----------+----------+----------+---------------+-------+--------")
+    print(f"SUM |            | {c2s(total_orig):>8} | {c2s(total_paid):>8} | {c2s(total_open):>8} |")
+
+
 def cmd_list_tenants(args):
     with conn() as cx:
         rows = cx.execute("""
@@ -1006,6 +1066,14 @@ def build_parser():
     sp.add_argument("--col-desc", default="Verwendungszweck")
     sp.add_argument("--strict", action="store_true", help="Bei Fehlern abbrechen")
     sp.set_defaults(func=cmd_import_bank)
+
+    sp = sub.add_parser("nka-status", help="NKA-Status (bezahlt/offen) je Forderung eines Mieters")
+    sp.add_argument("tenant_id", help="Mieter-ID (z. B. M001)")
+    sp.add_argument("--asof", default=None, help="Stichtag YYYY-MM-DD (Default: heute)")
+    sp.add_argument("--nka-accounts", default="3020", help="NKA-Zahlungskonten, Komma-getrennt (Default: 3020)")
+    sp.add_argument("--detail", action="store_true", help="Zwischenschritte der FIFO-Anrechnung anzeigen")
+    sp.set_defaults(func=cmd_nka_status)
+
 
     sp = sub.add_parser("tenant-transactions", help="Alle Buchungen eines Mieters anzeigen, gruppiert nach Konto")
     sp.add_argument("tenant_id", help="Mieter-ID")
